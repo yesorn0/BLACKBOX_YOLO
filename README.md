@@ -20,6 +20,10 @@
 - 블랙박스 기능 : 영상저장 및 객체 탐지 결과 기록
 - 실시간 처리 : 웹캠/비디오 실시간 추론
 
+## 시스템 구성
+<img width="400" alt="image" src="https://github.com/user-attachments/assets/f90d5dfd-f387-4035-a570-b426adf77d9a" />
+
+
 ## 사용기법
 ### 딥러닝 모델링
 YOLO 전이 학습
