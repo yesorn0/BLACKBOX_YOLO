@@ -1,0 +1,937 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+IoU 기반 차량 추적 블랙박스 시스템 v8.1 + TTS 최적화
+v4l2 자동 실행 + 한국 신호등 최적화 + 차선 기반 동적 앞차 감지
+"""
+
+import cv2
+import numpy as np
+import time
+import json
+import logging
+import os
+import signal
+import sys
+import psutil
+from datetime import datetime
+from collections import deque
+import argparse
+import queue
+import threading
+import hashlib
+from tts_config import LOGGING_LEVEL, LOGGING_FORMAT
+from tts_settings import TTSNavigationSystem
+
+logging.basicConfig(level=getattr(logging, LOGGING_LEVEL), format=LOGGING_FORMAT)
+
+
+class CameraManager:
+    def __init__(self, logger):
+        self.logger = logger
+        self.camera = None
+        
+    def init_camera_auto(self):
+        self.logger.info("🔍 v4l2 카메라 디바이스 자동 탐지 중...")
+        cap = cv2.VideoCapture(-1, cv2.CAP_V4L2)
+        if cap.isOpened():
+            ret, frame = cap.read()
+            if ret and frame is not None and frame.size > 0:
+                self.camera = cap
+                self.apply_camera_settings()
+                self.logger.info("✅ 카메라 초기화 완료")
+                return True
+        self.logger.error("❌ 카메라 초기화 실패")
+        cap.release()
+        return False
+    
+    def apply_camera_settings(self):
+        try:
+            self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            self.camera.set(cv2.CAP_PROP_FPS, 30)
+            self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception as e:
+            self.logger.warning(f"카메라 설정 적용 실패: {e}")
+
+class LaneDetector:
+    """차선 감지 및 동적 Front Zone 계산"""
+    
+    def __init__(self):
+        self.lane_history = deque(maxlen=5)
+        self.last_valid_lanes = None
+        
+    def detect_lanes(self, frame):
+        height, width = frame.shape[:2]
+        roi_vertices = np.array([
+            [(0, height), (width//2 - 50, height*0.65),
+             (width//2 + 50, height*0.65), (width, height)]
+        ], dtype=np.int32)
+        
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blur, 50, 150)
+        
+        mask = np.zeros_like(edges)
+        cv2.fillPoly(mask, [roi_vertices], 255)
+        masked_edges = cv2.bitwise_and(edges, mask)
+        
+        lines = cv2.HoughLinesP(
+            masked_edges, 
+            rho=1, 
+            theta=np.pi/180, 
+            threshold=50,
+            minLineLength=50, 
+            maxLineGap=50
+        )
+        
+        return self.process_lane_lines(lines, width, height)
+    
+    def process_lane_lines(self, lines, width, height):
+        if lines is None:
+            return self.last_valid_lanes
+        
+        left_lines = []
+        right_lines = []
+        
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            if x2 - x1 == 0:
+                continue
+            slope = (y2 - y1) / (x2 - x1)
+            
+            if slope < -0.5:
+                left_lines.append(line[0])
+            elif slope > 0.5:
+                right_lines.append(line[0])
+        
+        left_lane = self.average_lane(left_lines, width, height)
+        right_lane = self.average_lane(right_lines, width, height)
+        
+        if left_lane is not None or right_lane is not None:
+            lanes = {'left': left_lane, 'right': right_lane}
+            self.lane_history.append(lanes)
+            self.last_valid_lanes = lanes
+            return lanes
+        
+        return self.last_valid_lanes
+    
+    def average_lane(self, lane_lines, width, height):
+        if not lane_lines:
+            return None
+        
+        x_coords = []
+        y_coords = []
+        for line in lane_lines:
+            x1, y1, x2, y2 = line
+            x_coords.extend([x1, x2])
+            y_coords.extend([y1, y2])
+        
+        if len(x_coords) < 2:
+            return None
+        
+        poly = np.polyfit(y_coords, x_coords, 1)
+        y1 = height
+        y2 = int(height * 0.6)
+        x1 = int(poly[0] * y1 + poly[1])
+        x2 = int(poly[0] * y2 + poly[1])
+        
+        return [x1, y1, x2, y2]
+    
+    def calculate_lane_center_points(self, lanes, height):
+        if not lanes or (lanes['left'] is None and lanes['right'] is None):
+            return None
+        
+        center_points = []
+        for y in range(int(height * 0.65), height, 20):
+            left_x = None
+            right_x = None
+            
+            if lanes['left']:
+                x1, y1, x2, y2 = lanes['left']
+                if y2 != y1:
+                    left_x = x1 + (x2 - x1) * (y - y1) / (y2 - y1)
+            
+            if lanes['right']:
+                x1, y1, x2, y2 = lanes['right']
+                if y2 != y1:
+                    right_x = x1 + (x2 - x1) * (y - y1) / (y2 - y1)
+            
+            if left_x is not None and right_x is not None:
+                center_x = (left_x + right_x) / 2
+            elif left_x is not None:
+                center_x = left_x + 60
+            elif right_x is not None:
+                center_x = right_x - 60
+            else:
+                continue
+            
+            center_points.append((int(center_x), y))
+        
+        return center_points
+
+class SimpleIOUTracker:
+    """IoU 기반 단순 객체 추적기 (차선 존 내 감도 향상)"""
+    
+    def __init__(self, max_lost=5, iou_threshold=0.3, movement_threshold=2):  # 이동 임계값 2로 낮춤
+        self.tracks = {}
+        self.next_id = 1
+        self.max_lost = max_lost
+        self.iou_threshold = iou_threshold
+        self.movement_threshold = movement_threshold
+        self.frame_count = 0
+        
+    def calculate_iou(self, box1, box2):
+        x1, y1, w1, h1 = box1
+        x2, y2, w2, h2 = box2
+        
+        x_left = max(x1, x2)
+        y_top = max(y1, y2)
+        x_right = min(x1 + w1, x2 + w2)
+        y_bottom = min(y1 + h1, y2 + h2)
+        
+        if x_right < x_left or y_bottom < y_top:
+            return 0.0
+        
+        intersection = (x_right - x_left) * (y_bottom - y_top)
+        area1 = w1 * h1
+        area2 = w2 * h2
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0.0
+    
+    def detect_departure(self, track, is_in_zone=False):
+        """출발 감지: 존 내 차량은 더 민감하게 감지"""
+        if len(track['movement_history']) < 1:
+            return False
+            
+        # 최근 1프레임 이동량만으로도 감지
+        move_x, move_y = track['movement_history'][-1]
+        distance = (move_x**2 + move_y**2)**0.5
+        
+        # 존 내 차량은 임계값 50% 낮춤
+        threshold = self.movement_threshold * 0.5 if is_in_zone else self.movement_threshold
+        return distance > threshold
+    
+    def update(self, detections):
+        self.frame_count += 1
+        active_tracks = {tid: track for tid, track in self.tracks.items() if track['lost'] <= self.max_lost}
+        matched_tracks = set()
+        matched_detections = set()
+        
+        for track_id, track in active_tracks.items():
+            best_iou = 0
+            best_detection_idx = -1
+            for i, detection in enumerate(detections):
+                if i in matched_detections:
+                    continue
+                iou = self.calculate_iou(track['bbox'], detection['box'])
+                if iou > best_iou and iou > self.iou_threshold:
+                    best_iou = iou
+                    best_detection_idx = i
+            
+            if best_detection_idx != -1:
+                old_bbox = track['bbox']
+                new_bbox = detections[best_detection_idx]['box']
+                old_center_x = old_bbox[0] + old_bbox[2] / 2
+                old_center_y = old_bbox[1] + old_bbox[3] / 2
+                new_center_x = new_bbox[0] + new_bbox[2] / 2
+                new_center_y = new_bbox[1] + new_bbox[3] / 2
+                movement_x = new_center_x - old_center_x
+                movement_y = new_center_y - old_center_y
+                track['bbox'] = new_bbox
+                track['confidence'] = detections[best_detection_idx]['confidence']
+                track['lost'] = 0
+                track['movement_history'].append((movement_x, movement_y))
+                track['last_update'] = self.frame_count
+                
+                # 존 내 차량 여부 확인
+                is_in_zone = detections[best_detection_idx].get('in_zone', False)
+                if self.detect_departure(track, is_in_zone):
+                    track['is_moving'] = True
+                    track['departure_detected'] = True
+                
+                matched_tracks.add(track_id)
+                matched_detections.add(best_detection_idx)
+        
+        for track_id, track in active_tracks.items():
+            if track_id not in matched_tracks:
+                track['lost'] += 1
+        
+        for i, detection in enumerate(detections):
+            if i not in matched_detections:
+                self.tracks[self.next_id] = {
+                    'id': self.next_id,
+                    'bbox': detection['box'],
+                    'confidence': detection['confidence'],
+                    'class_name': detection['class_name'],
+                    'lost': 0,
+                    'created_frame': self.frame_count,
+                    'last_update': self.frame_count,
+                    'movement_history': deque(maxlen=10),
+                    'is_moving': False,
+                    'departure_detected': False
+                }
+                self.next_id += 1
+        
+        self.tracks = {tid: track for tid, track in self.tracks.items() if track['lost'] <= self.max_lost}
+        return self.get_active_tracks()
+    
+    def get_active_tracks(self):
+        return [track for track in self.tracks.values() if track['lost'] == 0]
+
+class TrafficLightColorDetector:
+    """신호등 색상 감지기 (색상 범위 정밀 조정)"""
+    
+    def __init__(self, stability_frames=2):
+        self.stability_frames = stability_frames
+        self.color_history = deque(maxlen=stability_frames)
+        self.last_stable_color = None
+        self.last_change_time = 0
+        self.previous_color = None
+        self.confidence_threshold = 0.5
+    
+    def detect_traffic_light_color(self, roi):
+        if roi.size == 0:
+            return None
+        
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        
+        # 색상 범위 재조정 (한국 신호등 최적화)
+        red_lower1 = np.array([0, 100, 100])    # 밝기 증가
+        red_upper1 = np.array([10, 255, 255])
+        red_lower2 = np.array([170, 100, 100])   # 밝기 증가
+        red_upper2 = np.array([180, 255, 255])
+        red_lower3 = np.array([0, 80, 80])      # 채도/밝기 하향
+        red_upper3 = np.array([15, 255, 255])   # Hue 범위 확장
+        red_lower4 = np.array([165, 80, 80])    # 채도/밝기 하향
+        red_upper4 = np.array([180, 255, 255])
+        
+        yellow_lower = np.array([18, 120, 120])  # 범위 축소
+        yellow_upper = np.array([35, 255, 255])
+        
+        green_lower = np.array([45, 100, 100])   # 범위 축소
+        green_upper = np.array([90, 255, 255])
+        
+        red_mask1 = cv2.inRange(hsv, red_lower1, red_upper1)
+        red_mask2 = cv2.inRange(hsv, red_lower2, red_upper2)
+        red_mask3 = cv2.inRange(hsv, red_lower3, red_upper3)
+        red_mask4 = cv2.inRange(hsv, red_lower4, red_upper4)
+        red_mask = red_mask1 + red_mask2 + red_mask3 + red_mask4
+        
+        yellow_mask = cv2.inRange(hsv, yellow_lower, yellow_upper)
+        green_mask = cv2.inRange(hsv, green_lower, green_upper)
+        
+        red_pixels = cv2.countNonZero(red_mask)
+        yellow_pixels = cv2.countNonZero(yellow_mask)
+        green_pixels = cv2.countNonZero(green_mask)
+        
+        max_pixels = max(red_pixels, yellow_pixels, green_pixels)
+        
+        if max_pixels < 15:  # 임계값 상향
+            return None
+        
+        if red_pixels == max_pixels:
+            return 'red'
+        elif yellow_pixels == max_pixels:
+            return 'yellow'
+        elif green_pixels == max_pixels:
+            return 'green'
+        
+        return None
+    
+    def update_color_history(self, color):
+        if color:
+            self.color_history.append(color)
+        
+        if len(self.color_history) >= self.stability_frames:
+            color_counts = {}
+            for c in self.color_history:
+                color_counts[c] = color_counts.get(c, 0) + 1
+            
+            most_common_color = max(color_counts, key=color_counts.get)
+            confidence = color_counts[most_common_color] / self.stability_frames
+            
+            if confidence >= self.confidence_threshold:
+                if self.last_stable_color != most_common_color:
+                    change_info = {
+                        'datetime': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        'timestamp': time.time()
+                    }
+                    self.previous_color = self.last_stable_color
+                    self.last_stable_color = most_common_color
+                    self.last_change_time = time.time()
+                    return change_info
+        return None
+
+class ProfessionalSmartBlackBox:
+    """IoU 기반 차량 추적 블랙박스 시스템"""
+    
+    def __init__(self, config_path="blackbox_config.json"):
+        self.setup_logging()
+        self.config_path = config_path
+        self.config = self.load_config()
+        self.camera_manager = CameraManager(self.logger)
+        self.net = None
+        self.classes = []
+        self.output_layers = []
+        self.running = False
+        self.current_frame = None
+        self.last_valid_frame = None
+        self.video_writer = None
+        self.frame_buffer = deque(maxlen=300)
+        self.vehicle_tracker = SimpleIOUTracker(
+            max_lost=5, 
+            iou_threshold=0.3, 
+            movement_threshold=2
+        )
+        self.traffic_light_detector = TrafficLightColorDetector()
+        self.lane_detector = LaneDetector()
+        self.event_log_file = "./text/event_log.txt"
+        self.detection_stats = {
+            'total_detections': 0,
+            'vehicles': 0,
+            'persons': 0,
+            'traffic_lights': 0,
+            'traffic_light_changes': 0,
+            'vehicle_departures': 0
+        }
+        self.system_stats = {
+            'cpu': 0,
+            'memory': 0,
+            'disk': 0,
+            'temperature': 'N/A'
+        }
+        self.last_cleanup = 0
+        self.last_detection_time = 0
+        self.last_detections = []
+        self.last_incident_report = 0
+        self.frame_read_failures = 0
+        self.max_frame_read_failures = 10
+        self.logger.info("✅ IoU 기반 차량 추적 블랙박스 시스템 초기화 완료")
+        self.tts_system = TTSNavigationSystem()
+        self.TTS_ALLOWED = ["신호가 변경되었습니다", "앞의 차량이 출발하였습니다"]
+
+        # --- 로그 비동기화 및 TTS 중복 방지 최적화 ---
+        self.log_queue = queue.Queue(maxsize=1000)
+        self.log_buffer = []
+        self.log_thread = threading.Thread(target=self._log_worker, daemon=True)
+        self.log_thread.start()
+        self.tts_message_hashes = set()
+        # -------------------------------------------
+    def setup_logging(self):
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler('blackbox.log', encoding='utf-8'),
+                logging.StreamHandler()
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+    
+    def load_config(self):
+        default_config = {
+            "camera": {
+                "device_id": "auto",
+                "width": 1280,
+                "height": 720,
+                "fps": 30,
+                "buffer_size": 1
+            },
+            "recording": {
+                "output_dir": "recordings",
+                "segment_duration": 600,
+                "codec": "mp4v",
+                "quality": 0.8
+            },
+            "storage": {
+                "recordings_dir": "recordings",
+            },
+            "video": {
+                "fps": 30
+            },
+            "model": {
+                "weights_path": "yolov4.weights",
+                "config_path": "yolov4.cfg",
+                "classes_path": "coco.names",
+                "input_size": 416
+            },
+            "detection": {
+                "confidence_threshold": 0.5,
+                "nms_threshold": 0.4,
+                "traffic_light_confidence_threshold": 0.3,
+                "detection_interval": 1,
+                "traffic_light_only_interval": 1
+            },
+            "traffic_light": {
+                "enable_detection": True,
+                "stability_frames": 2,
+                "log_changes": True
+            },
+            "tracking": {
+                "iou_threshold": 0.3,
+                "max_lost_frames": 5,
+                "movement_threshold": 2  # 5 → 2로 변경
+            },
+            "system": {
+                "cleanup_interval": 3600,
+                "max_storage_gb": 50,
+                "cpu_threshold": 80,
+                "memory_threshold": 80
+            }
+        }
+        try:
+            if os.path.exists(self.config_path):
+                with open(self.config_path, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                for key, value in default_config.items():
+                    if key not in config:
+                        config[key] = value
+                    elif isinstance(value, dict):
+                        for subkey, subvalue in value.items():
+                            if subkey not in config[key]:
+                                config[key][subkey] = subvalue
+                return config
+            else:
+                with open(self.config_path, 'w', encoding='utf-8') as f:
+                    json.dump(default_config, f, indent=2, ensure_ascii=False)
+                return default_config
+        except Exception as e:
+            self.logger.error(f"설정 파일 로드 실패: {e}")
+            return default_config
+    
+    def init_camera(self):
+        return self.camera_manager.init_camera_auto()
+    
+    def init_ai_model(self):
+        try:
+            weights_path = self.config['model']['weights_path']
+            config_path = self.config['model']['config_path']
+            classes_path = self.config['model']['classes_path']
+            
+            if not all(os.path.exists(p) for p in [weights_path, config_path, classes_path]):
+                self.logger.warning("AI 모델 파일이 없습니다. 기본 녹화 모드로 실행됩니다.")
+                return False
+            
+            self.net = cv2.dnn.readNet(weights_path, config_path)
+            self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+            self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+            
+            with open(classes_path, 'r') as f:
+                self.classes = [line.strip() for line in f.readlines()]
+            
+            layer_names = self.net.getLayerNames()
+            self.output_layers = [layer_names[i - 1] for i in self.net.getUnconnectedOutLayers()]
+            
+            self.logger.info(f"✅ AI 모델 로드 완료: {len(self.classes)}개 클래스")
+            return True
+        except Exception as e:
+            self.logger.error(f"AI 모델 초기화 실패: {e}")
+            return False
+    
+    def create_video_writer(self, frame_shape):
+        try:
+            output_dir = self.config['storage']['recordings_dir']
+            os.makedirs(output_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"REC_{timestamp}.mp4"
+            filepath = os.path.join(output_dir, filename)
+            height, width = frame_shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            fps = self.config['video']['fps']
+            if width % 2 != 0:
+                width -= 1
+            if height % 2 != 0:
+                height -= 1
+            writer = cv2.VideoWriter(filepath, fourcc, fps, (width, height))
+            if writer.isOpened():
+                self.logger.info(f"✅ 녹화 시작: {filename} ({width}x{height})")
+                return writer, filepath
+            else:
+                self.logger.error(f"❌ 비디오 라이터 생성 실패: {filepath}")
+                return None, None
+        except Exception as e:
+            self.logger.error(f"비디오 라이터 생성 실패: {e}")
+            return None, None
+    
+    def filter_vehicles_by_lane(self, vehicle_detections, frame_width, frame_height, frame):
+        lanes = self.lane_detector.detect_lanes(frame)
+        if lanes is None:
+            return vehicle_detections
+        center_points = self.lane_detector.calculate_lane_center_points(lanes, frame_height)
+        if not center_points:
+            return vehicle_detections
+        filtered = []
+        lane_width = 100
+        min_area = (frame_width * frame_height) * 0.01
+        for detection in vehicle_detections:
+            x, y, w, h = detection['box']
+            vehicle_center_x = x + w / 2
+            vehicle_center_y = y + h / 2
+            if vehicle_center_y < frame_height * 0.65:
+                continue
+            closest_point = min(center_points, key=lambda p: abs(p[1] - vehicle_center_y))
+            lane_center_x = closest_point[0]
+            if abs(vehicle_center_x - lane_center_x) < lane_width / 2 and w * h > min_area:
+                detection['in_zone'] = True  # 존 내 차량 마킹
+                filtered.append(detection)
+        return filtered
+    
+    def detect_objects_optimized(self, frame):
+        height, width = frame.shape[:2]
+        input_size = self.config['model'].get('input_size', 416)
+        blob = cv2.dnn.blobFromImage(frame, 0.00392, (input_size, input_size), (0, 0, 0), True, crop=False)
+        self.net.setInput(blob)
+        outputs = self.net.forward(self.output_layers)
+        boxes, confidences, class_ids = [], [], []
+        confidence_threshold = self.config['detection']['confidence_threshold']
+        traffic_light_confidence_threshold = self.config['detection']['traffic_light_confidence_threshold']
+        for output in outputs:
+            for detection in output:
+                scores = detection[5:]
+                class_id = np.argmax(scores)
+                confidence = scores[class_id]
+                class_name = self.classes[class_id]
+                min_conf = traffic_light_confidence_threshold if class_name == 'traffic light' else confidence_threshold
+                if confidence > min_conf:
+                    center_x = int(detection[0] * width)
+                    center_y = int(detection[1] * height)
+                    w = int(detection[2] * width)
+                    h = int(detection[3] * height)
+                    x = int(center_x - w / 2)
+                    y = int(center_y - h / 2)
+                    boxes.append([x, y, w, h])
+                    confidences.append(float(confidence))
+                    class_ids.append(class_id)
+        indexes = cv2.dnn.NMSBoxes(boxes, confidences, 
+                                  traffic_light_confidence_threshold,
+                                  self.config['detection']['nms_threshold'])
+        detections, vehicle_detections, traffic_light_detections = [], [], []
+        if len(indexes) > 0:
+            for i in indexes.flatten():
+                class_name = self.classes[class_ids[i]]
+                detection = {
+                    'class_name': class_name,
+                    'confidence': confidences[i],
+                    'box': boxes[i],
+                    'timestamp': time.time()
+                }
+                detections.append(detection)
+                if class_name == 'traffic light':
+                    traffic_light_detections.append(detection)
+                    self.detection_stats['traffic_lights'] += 1
+                if class_name in ['car', 'truck', 'bus', 'motorbike', 'bicycle']:
+                    vehicle_detections.append(detection)
+                    self.detection_stats['vehicles'] += 1
+                self.detection_stats['total_detections'] += 1
+                if class_name == 'person':
+                    self.detection_stats['persons'] += 1
+        filtered_vehicle_detections = self.filter_vehicles_by_lane(vehicle_detections, width, height, frame)
+        tracked_vehicles = []
+        if filtered_vehicle_detections:
+            tracked_vehicles = self.vehicle_tracker.update(filtered_vehicle_detections)
+            for track in tracked_vehicles:
+                if track.get('departure_detected', False):
+                    self.log_vehicle_departure(track)
+                    track['departure_detected'] = False
+        if traffic_light_detections and self.config['traffic_light']['enable_detection']:
+            self.analyze_traffic_light_colors_fast(frame, traffic_light_detections)
+        return detections, tracked_vehicles
+    
+    def analyze_traffic_light_colors_fast(self, frame, traffic_light_detections):
+        for detection in traffic_light_detections:
+            x, y, w, h = detection['box']
+            roi = frame[max(0, y):min(frame.shape[0], y+h), max(0, x):min(frame.shape[1], x+w)]
+            if roi.size > 100:
+                detected_color = self.traffic_light_detector.detect_traffic_light_color(roi)
+                color_change = self.traffic_light_detector.update_color_history(detected_color)
+                if color_change:
+                    self.handle_traffic_light_change_fast(color_change)
+
+    def _log_worker(self):
+        """비동기 로그 기록 워커"""
+        while True:
+            try:
+                try:
+                    msg = self.log_queue.get(timeout=0.2)
+                    self.log_buffer.append(msg)
+                except queue.Empty:
+                    pass
+                # 버퍼가 5개 이상이거나, 큐가 비었을 때 쓰기
+                if len(self.log_buffer) >= 5 or (self.log_queue.empty() and self.log_buffer):
+                    with open(self.event_log_file, "a", encoding="utf-8") as f:
+                        f.write("\n".join(self.log_buffer) + "\n")
+                    self.log_buffer.clear()
+                time.sleep(0.01)
+            except Exception as e:
+                self.logger.error(f"비동기 로그 쓰기 실패: {e}")
+    def handle_traffic_light_change_fast(self, change_info):
+        log_message = "신호가 변경되었습니다"
+        self.log_queue.put(log_message)
+        self.logger.info(f"🚦 {log_message}")
+        self._tts_announce_if_needed(log_message)
+        self.detection_stats['traffic_light_changes'] += 1
+
+    def log_vehicle_departure(self, track):
+        if track.get('departure_detected', False):
+            log_message = "앞의 차량이 출발하였습니다"
+            self.log_queue.put(log_message)
+            self.logger.info(f"🚗 차량 출발: ID{track['id']}")
+            self.detection_stats['vehicle_departures'] += 1
+            self._tts_announce_if_needed(log_message)
+    def _tts_announce_if_needed(self, msg):
+        """해시 기반 중복 방지 TTS 안내"""
+        msg_hash = hashlib.md5(msg.encode()).hexdigest()
+        if msg in self.TTS_ALLOWED and msg_hash not in self.tts_message_hashes:
+            try:
+                self.tts_system.play_situation_from_txt(msg, keyword=msg)
+                self.tts_message_hashes.add(msg_hash)
+                # 오래된 해시는 1000개 이상이면 제거
+                if len(self.tts_message_hashes) > 1000:
+                    self.tts_message_hashes.pop()
+            except Exception as e:
+                self.logger.error(f"TTS 안내 실패: {e}")
+    
+    def draw_lane_overlay(self, overlay, lanes, center_points, width, height):
+        if lanes is None:
+            return
+        if lanes['left']:
+            x1, y1, x2, y2 = lanes['left']
+            cv2.line(overlay, (x1, y1), (x2, y2), (0, 255, 0), 3)
+        if lanes['right']:
+            x1, y1, x2, y2 = lanes['right']
+            cv2.line(overlay, (x1, y1), (x2, y2), (0, 255, 0), 3)
+        if center_points:
+            for i in range(len(center_points) - 1):
+                cv2.line(overlay, center_points[i], center_points[i+1], (255, 255, 0), 2)
+            lane_width = 100
+            for point in center_points:
+                cx, cy = point
+                cv2.rectangle(overlay, (cx - lane_width//2, cy - 2), (cx + lane_width//2, cy + 2), (0, 255, 255), -1)
+    
+    def draw_optimized_overlay(self, frame, detections, tracked_vehicles):
+        overlay = frame.copy()
+        height, width = frame.shape[:2]
+        lanes = self.lane_detector.last_valid_lanes
+        center_points = self.lane_detector.calculate_lane_center_points(lanes, height) if lanes else None
+        self.draw_lane_overlay(overlay, lanes, center_points, width, height)
+        for detection in detections:
+            x, y, w, h = detection['box']
+            class_name = detection['class_name']
+            confidence = detection['confidence']
+            colors = {
+                'traffic light': (255, 255, 255),
+                'car': (0, 255, 0), 'truck': (255, 0, 0), 'bus': (0, 0, 255),
+                'person': (255, 255, 0), 'bicycle': (255, 0, 255), 'motorbike': (0, 255, 255)
+            }
+            color = colors.get(class_name, (128, 128, 128))
+            thickness = 3 if class_name == 'traffic light' else 2
+            cv2.rectangle(overlay, (x, y), (x + w, y + h), color, thickness)
+            if class_name == 'traffic light':
+                current_color = self.traffic_light_detector.last_stable_color
+                if current_color:
+                    color_text = f"LIGHT: {current_color.upper()}"
+                    cv2.putText(overlay, color_text, (x, y + h + 25), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            label = f"{class_name}: {confidence:.2f}"
+            cv2.putText(overlay, label, (x, y - 5), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        for track in tracked_vehicles:
+            x, y, w, h = track['bbox']
+            track_id = track['id']
+            class_name = track['class_name']
+            track_color = (0, 0, 255) if track['is_moving'] else (0, 255, 0)
+            cv2.rectangle(overlay, (x, y), (x + w, y + h), track_color, 3)
+            status = "MOVING" if track['is_moving'] else "STATIC"
+            track_label = f"ID:{track_id} {class_name} {status}"
+            cv2.putText(overlay, track_label, (x, y - 25), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, track_color, 2)
+        panel_height = 140
+        cv2.rectangle(overlay, (0, 0), (overlay.shape[1], panel_height), (0, 0, 0), -1)
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        cv2.putText(overlay, f"TIME: {timestamp}", (10, 25), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(overlay, "LANE-BASED FRONT VEHICLE TRACKING", (10, 50), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        active_tracks = len(tracked_vehicles)
+        moving_tracks = len([t for t in tracked_vehicles if t['is_moving']])
+        stats_text = f"Tracks:{active_tracks} Moving:{moving_tracks} TL:{self.detection_stats['traffic_lights']} TC:{self.detection_stats['traffic_light_changes']}"
+        cv2.putText(overlay, stats_text, (10, 75), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+        departure_text = f"Departures: {self.detection_stats['vehicle_departures']}"
+        cv2.putText(overlay, departure_text, (10, 100), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+        if self.traffic_light_detector.last_stable_color:
+            light_status = f"SIGNAL: {self.traffic_light_detector.last_stable_color.upper()}"
+            cv2.putText(overlay, light_status, (overlay.shape[1] - 250, 25), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        return overlay
+    
+    def monitor_system_resources(self):
+        try:
+            cpu_percent = psutil.cpu_percent()
+            memory_percent = psutil.virtual_memory().percent
+            self.system_stats = {
+                'cpu': cpu_percent,
+                'memory': memory_percent,
+                'disk': 0,
+                'temperature': 'N/A'
+            }
+        except Exception as e:
+            self.logger.error(f"시스템 모니터링 오류: {e}")
+    
+    def cleanup_old_files(self):
+        try:
+            output_dir = self.config['storage']['recordings_dir']
+            if not os.path.exists(output_dir):
+                return
+            max_size_bytes = self.config['system']['max_storage_gb'] * 1024 * 1024 * 1024
+            files = []
+            total_size = 0
+            for filename in os.listdir(output_dir):
+                filepath = os.path.join(output_dir, filename)
+                if os.path.isfile(filepath):
+                    size = os.path.getsize(filepath)
+                    mtime = os.path.getmtime(filepath)
+                    files.append((filepath, size, mtime))
+                    total_size += size
+            if total_size > max_size_bytes:
+                files.sort(key=lambda x: x[2])
+                for filepath, size, mtime in files:
+                    try:
+                        os.remove(filepath)
+                        total_size -= size
+                        self.logger.info(f"오래된 파일 삭제: {os.path.basename(filepath)}")
+                        if total_size <= max_size_bytes * 0.8:
+                            break
+                    except Exception as e:
+                        self.logger.error(f"파일 삭제 실패 {filepath}: {e}")
+        except Exception as e:
+            self.logger.error(f"파일 정리 실패: {e}")
+    
+    def signal_handler(self, signum, frame):
+        self.running = False
+        self.cleanup_resources()
+        sys.exit(0)
+    
+    def cleanup_resources(self):
+        # 로그 버퍼 마지막으로 비우기
+        if self.log_buffer:
+            try:
+                with open(self.event_log_file, "a", encoding="utf-8") as f:
+                    f.write("\n".join(self.log_buffer) + "\n")
+                self.log_buffer.clear()
+            except Exception as e:
+                self.logger.error(f"로그 플러시 실패: {e}")
+        # ... 기존 정리 코드 ...
+        try:
+            if self.video_writer:
+                self.video_writer.release()
+            if self.camera_manager.camera:
+                self.camera_manager.camera.release()
+            cv2.destroyAllWindows()
+        except Exception as e:
+            self.logger.error(f"리소스 정리 실패: {e}")
+    
+    def run_optimized(self):
+        signal.signal(signal.SIGINT, self.signal_handler)
+        signal.signal(signal.SIGTERM, self.signal_handler)
+        if not self.init_camera():
+            return False
+        if not self.init_ai_model():
+            self.logger.warning("AI 모델 없이 기본 녹화 모드로 실행")
+        self.running = True
+        frame_count = 0
+        segment_start_time = time.time()
+        last_fps_time = time.time()
+        fps_counter = 0
+        while self.running:
+            try:
+                ret, frame = self.camera_manager.camera.read()
+                if not ret or frame is None:
+                    self.frame_read_failures += 1
+                    if self.frame_read_failures > self.max_frame_read_failures:
+                        self.logger.error("연속 프레임 읽기 실패, 종료")
+                        break
+                    self.logger.warning("프레임 읽기 실패")
+                    time.sleep(0.01)
+                    continue
+                self.frame_read_failures = 0
+                self.current_frame = frame.copy()
+                self.frame_buffer.append(frame.copy())
+                if self.video_writer is None or (time.time() - segment_start_time) > self.config['recording']['segment_duration']:
+                    if self.video_writer:
+                        self.video_writer.release()
+                    self.video_writer, video_path = self.create_video_writer(frame.shape)
+                    if self.video_writer is None:
+                        break
+                    segment_start_time = time.time()
+                detections = []
+                tracked_vehicles = []
+                detection_interval = self.config['detection']['detection_interval']
+                traffic_light_interval = self.config['detection'].get('traffic_light_only_interval', 1)
+                if self.net is not None:
+                    if frame_count % traffic_light_interval == 0:
+                        detections, tracked_vehicles = self.detect_objects_optimized(frame)
+                    elif frame_count % detection_interval == 0:
+                        detections, tracked_vehicles = self.detect_objects_optimized(frame)
+                overlay_frame = self.draw_optimized_overlay(frame.copy(), detections, tracked_vehicles)
+                self.current_frame = overlay_frame.copy()
+                if self.video_writer and self.video_writer.isOpened():
+                    try:
+                        if overlay_frame.shape[1] % 2 != 0:
+                            overlay_frame = overlay_frame[:, :-1]
+                        if overlay_frame.shape[0] % 2 != 0:
+                            overlay_frame = overlay_frame[:-1, :]
+                        self.video_writer.write(overlay_frame)
+                    except Exception as e:
+                        self.logger.error(f"프레임 저장 실패: {e}")
+                fps_counter += 1
+                if fps_counter % 30 == 0:
+                    current_time = time.time()
+                    fps = 30 / (current_time - last_fps_time)
+                    last_fps_time = current_time
+                    active_tracks = len(tracked_vehicles)
+                    moving_vehicles = len([t for t in tracked_vehicles if t['is_moving']])
+                    self.logger.info(f"📊 FPS: {fps:.1f}, 추적: {active_tracks}, 이동중: {moving_vehicles}, 신호등: {self.detection_stats['traffic_lights']}, 변화: {self.detection_stats['traffic_light_changes']}, 출발: {self.detection_stats['vehicle_departures']}")
+                if frame_count % 100 == 0:
+                    self.monitor_system_resources()
+                current_time = time.time()
+                if current_time - self.last_cleanup > self.config['system']['cleanup_interval']:
+                    self.cleanup_old_files()
+                    self.last_cleanup = current_time
+                frame_count += 1
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                self.logger.error(f"실행 중 오류: {e}")
+                break
+        self.cleanup_resources()
+        return True
+
+def main():
+    parser = argparse.ArgumentParser(description='IoU 기반 차량 추적 블랙박스 (차선 기반 동적 앞차 감지 + TTS 최적화)')
+    parser.add_argument('--config', default='blackbox_config.json', help='설정 파일 경로')
+    parser.add_argument('--debug', action='store_true', help='디버그 모드')
+    args = parser.parse_args()
+    try:
+        blackbox = ProfessionalSmartBlackBox(args.config)
+        success = blackbox.run_optimized()
+        if success:
+            pass
+        else:
+            return 1
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        if args.debug:
+            import traceback
+            traceback.print_exc()
+        return 1
+    finally:
+        pass
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
