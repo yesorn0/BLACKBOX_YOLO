@@ -52,3 +52,7 @@ YOLO 전이 학습
 - 교통안전시설 : 시선유도표지, 갈매기 표지 등
 - 구조물 : 교량, 터널, 지하차도, 고가차도 등
 - 보안시설 : 도로전광표시, 긴급연락시설 등
+
+## GUI
+<img width="801" height="563" alt="스크린샷 2025-06-16 154202" src="https://github.com/user-attachments/assets/70c09654-ee46-4e56-835f-da009959dc6a" />
+
