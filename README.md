@@ -7,6 +7,8 @@
 | <img width="400" alt="image" src="https://github.com/user-attachments/assets/a582185f-a4fb-46e3-8fdd-6d063d972737" /> | <img width="400" alt="image" src="https://github.com/user-attachments/assets/1dfe51de-312a-4d5d-aa94-59d8af46ff2b" /> |
 
 
+## GUI
+<img width="801" height="563" alt="스크린샷 2025-06-16 154202" src="https://github.com/user-attachments/assets/70c09654-ee46-4e56-835f-da009959dc6a" />
 
 ## 개요
 신호 정체시 휴대폰 사용 등 여러 이유로 신호변경을 인지하지 못한 운전자로 인해 교차로 정체 발생
@@ -53,6 +55,4 @@ YOLO 전이 학습
 - 구조물 : 교량, 터널, 지하차도, 고가차도 등
 - 보안시설 : 도로전광표시, 긴급연락시설 등
 
-## GUI
-<img width="801" height="563" alt="스크린샷 2025-06-16 154202" src="https://github.com/user-attachments/assets/70c09654-ee46-4e56-835f-da009959dc6a" />
 
